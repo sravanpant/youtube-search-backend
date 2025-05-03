@@ -129,7 +129,10 @@ youtube_manager = YouTubeAPIManager()
 # Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Adjust this to your frontend origin
+    allow_origins=[
+        "http://localhost:3000",
+        "https://youtube-search-frontend.vercel.app",
+    ],  # Adjust this to your frontend origin
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

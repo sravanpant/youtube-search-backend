@@ -1,29 +1,23 @@
 # Web Framework and API
-fastapi[all]>=0.68.0,<1.0.0
-uvicorn[standard]>=0.15.0,<1.0.0
-pydantic>=1.8.0,<2.0.0
+fastapi[standard]
+uvicorn[standard]
+pydantic
 
 # Async HTTP
-aiohttp>=3.8.0,<4.0.0
+aiohttp
 
 # Google API and YouTube
-google-api-python-client>=2.0.0,<3.0.0
-google-auth>=2.0.0,<3.0.0
-google-auth-httplib2>=0.1.0,<1.0.0
-google-auth-oauthlib>=0.4.0,<1.0.0
-
+google-api-python-client
 # Environment and Utils
-python-dotenv>=0.19.0,<1.0.0
-isodate>=0.6.0,<1.0.0
+python-dotenv
+isodate
 
 # CORS and Middleware
-starlette>=0.14.0,<1.0.0
-
+starlette
 # HTTP Client
-httpx>=0.23.0,<1.0.0
+httpx
 
 # Async Support
-asyncio>=3.4.3,<4.0.0
-
+asyncio
 # Type Hints
-typing-extensions>=4.0.0,<5.0.0
+typing-extensions

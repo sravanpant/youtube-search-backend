@@ -119,62 +119,8 @@ youtube-content-search/
 ├── requirements.txt    # Project dependencies
 ├── .env               # Environment variables
 ├── README.md          # Project documentation
-└── tests/             # Test files
 ```
 
-## Development
-
-1. Install development dependencies:
-```bash
-pip install -r dev-requirements.txt
-```
-
-2. Run tests:
-```bash
-pytest
-```
-
-3. Format code:
-```bash
-black .
-isort .
-```
-
-## Docker Support
-
-1. Build the Docker image:
-```bash
-docker build -t youtube-content-search .
-```
-
-2. Run the container:
-```bash
-docker run -p 8000:8000 -d youtube-content-search
-```
-
-## Error Handling
-
-The API includes comprehensive error handling for:
-- YouTube API quota exceeded
-- Invalid API keys
-- Network errors
-- Invalid input parameters
-- Missing configuration
-
-## Rate Limiting and Quotas
-
-- YouTube Data API has a daily quota limit
-- The application automatically rotates through multiple API keys
-- Google Custom Search API has separate quota limits
-- Configure your API keys and quotas in the Google Cloud Console
-
-## Contributing
-
-1. Fork the repository
-2. Create a feature branch
-3. Commit your changes
-4. Push to the branch
-5. Create a Pull Request
 
 ## License
 
@@ -187,27 +133,3 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 - FastAPI framework
 - Async Python community
 
-## Support
-
-For support, please open an issue in the GitHub repository or contact [your-email@example.com].
-
-## Authors
-
-- Your Name - Initial work - [YourGitHub](https://github.com/yourusername)
-
-## Version History
-
-- 0.1.0
-    - Initial Release
-    - Basic search functionality
-- 0.2.0
-    - Added multiple API key support
-    - Improved error handling
-
-## Future Improvements
-
-- [ ] Add caching layer
-- [ ] Implement rate limiting
-- [ ] Add more search filters
-- [ ] Improve relevancy scoring
-- [ ] Add authentication

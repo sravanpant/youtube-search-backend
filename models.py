@@ -1,10 +1,31 @@
+# backend/models.py
+
 from typing import List, Optional, Dict, Any
 from pydantic import BaseModel
+from datetime import datetime
+from enum import Enum
+
+class DateFilterOption(str, Enum):
+    PAST_HOUR = "past_hour"
+    PAST_3_HOURS = "past_3_hours" 
+    PAST_6_HOURS = "past_6_hours"
+    PAST_12_HOURS = "past_12_hours"
+    PAST_24_HOURS = "past_24_hours"
+    PAST_7_DAYS = "past_7_days"
+    PAST_30_DAYS = "past_30_days"
+    PAST_90_DAYS = "past_90_days"
+    PAST_180_DAYS = "past_180_days"
+    CUSTOM = "custom"
+    ALL_TIME = "all_time"
 
 class SearchRequest(BaseModel):
     brand_name: str
     max_results: int = 30
     min_views: Optional[int] = 1000
+    date_filter: DateFilterOption = DateFilterOption.ALL_TIME
+    custom_date_from: Optional[datetime] = None
+    custom_date_to: Optional[datetime] = None
+    country_code: Optional[str] = None  # ISO 3166-1 alpha-2 country code (e.g., "US", "GB")
 
 class VideoDetails(BaseModel):
     videoId: str
@@ -23,3 +44,4 @@ class VideoDetails(BaseModel):
     channelLink: Optional[str]
     relevancy_score: int = 0
     brand_links: List[str] = []
+    country: Optional[str] = None  # Add this field to store country data

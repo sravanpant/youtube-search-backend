@@ -17,6 +17,9 @@ starlette
 # HTTP Client
 httpx
 
+# caching
+redis
+
 # Async Support
 asyncio
 # Type Hints

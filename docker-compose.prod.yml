@@ -1,0 +1,15 @@
+# docker-compose.prod.yml
+
+services:
+  backend:
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --workers 4
+    restart: unless-stopped
+    environment:
+      - ENVIRONMENT=production
+      - DEBUG=false
+      - REDIS_URL=redis://redis:6379
+
+  # In production, you might want to hide Redis Commander or secure it further
+  redis-commander:
+    environment:
+      - HTTP_PASSWORD=${REDIS_ADMIN_PASSWORD}

@@ -52,7 +52,7 @@ YOUTUBE_API_KEY_21 = os.getenv("YOUTUBE_API_KEY_21")
 GOOGLE_CSE_API_KEY = os.getenv("GOOGLE_CSE_API_KEY")
 GOOGLE_CSE_ID = os.getenv("GOOGLE_CSE_ID")
 
-REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379")
+REDIS_URL = os.getenv("REDIS_URL")
 cache = RedisCache(REDIS_URL)
 
 redis_client = Redis(connection_pool=cache.pool)
@@ -64,7 +64,24 @@ class YouTubeAPIManager:
         self.api_keys = [
             YOUTUBE_API_KEY_1,
             YOUTUBE_API_KEY_2,
-            # ... other keys ...
+            YOUTUBE_API_KEY_3,
+            YOUTUBE_API_KEY_4,
+            YOUTUBE_API_KEY_5,
+            YOUTUBE_API_KEY_6,
+            YOUTUBE_API_KEY_7,
+            YOUTUBE_API_KEY_8,
+            YOUTUBE_API_KEY_9,
+            YOUTUBE_API_KEY_10,
+            YOUTUBE_API_KEY_11,
+            YOUTUBE_API_KEY_12,
+            YOUTUBE_API_KEY_13,
+            YOUTUBE_API_KEY_14,
+            YOUTUBE_API_KEY_15,
+            YOUTUBE_API_KEY_16,
+            YOUTUBE_API_KEY_17,
+            YOUTUBE_API_KEY_18,
+            YOUTUBE_API_KEY_19,
+            YOUTUBE_API_KEY_20,
             YOUTUBE_API_KEY_21,
         ]
         # Filter out None values

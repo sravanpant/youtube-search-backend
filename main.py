@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 import asyncio
 from cache import RedisCache
 from typing import List
-from models import SearchRequest, VideoDetails, DateFilterOption
+from models import SearchRequest, VideoDetails, DateFilterOption, KeywordFilterOption
 from utils import (
     extract_video_id_from_url,
     calculate_relevancy_score,
@@ -22,6 +22,8 @@ import time
 import json
 import hashlib
 from redis import Redis
+import time
+from collections import deque
 
 load_dotenv()
 
@@ -58,78 +60,144 @@ redis_client = Redis(connection_pool=cache.pool)
 
 class YouTubeAPIManager:
     def __init__(self):
+        # Load all API keys
         self.api_keys = [
             YOUTUBE_API_KEY_1,
             YOUTUBE_API_KEY_2,
-            YOUTUBE_API_KEY_3,
-            YOUTUBE_API_KEY_4,
-            YOUTUBE_API_KEY_5,
-            YOUTUBE_API_KEY_6,
-            YOUTUBE_API_KEY_7,
-            YOUTUBE_API_KEY_8,
-            YOUTUBE_API_KEY_9,
-            YOUTUBE_API_KEY_10,
-            YOUTUBE_API_KEY_11,
-            YOUTUBE_API_KEY_12,
-            YOUTUBE_API_KEY_13,
-            YOUTUBE_API_KEY_14,
-            YOUTUBE_API_KEY_15,
-            YOUTUBE_API_KEY_16,
-            YOUTUBE_API_KEY_17,
-            YOUTUBE_API_KEY_18,
-            YOUTUBE_API_KEY_19,
-            YOUTUBE_API_KEY_20,
+            # ... other keys ...
             YOUTUBE_API_KEY_21,
         ]
         # Filter out None values
         self.api_keys = [key for key in self.api_keys if key]
-        self.current_key_index = 0
+
+        # Two-tier key management system
+        self.available_keys = deque(range(len(self.api_keys)))  # O(1) operations
+        self.quota_exceeded_keys = {}  # key_index -> timestamp when quota was exceeded
+
+        # Statistics for optimization
+        self.key_usage_count = {i: 0 for i in range(len(self.api_keys))}
+        self.key_failure_count = {i: 0 for i in range(len(self.api_keys))}
+
+        # Quota reset time (in seconds) - typically 24 hours for YouTube
+        self.quota_reset_period = 24 * 60 * 60  # 24 hours
+
+        # Initialize client with first available key
+        self.current_key_index = self.available_keys[0] if self.available_keys else None
         self.youtube_client = None
         self._initialize_client()
 
     def _initialize_client(self) -> None:
         """Initialize YouTube client with current API key."""
-        if self.api_keys:
-            self.youtube_client = build(
-                "youtube", "v3", developerKey=self.api_keys[self.current_key_index]
-            )
-        else:
-            raise ValueError("No valid YouTube API keys available")
+        if self.current_key_index is None:
+            self._restore_expired_quota_keys()
+            if not self.available_keys:
+                raise ValueError("No valid YouTube API keys available")
+            self.current_key_index = self.available_keys[0]
 
-    def switch_to_next_key(self) -> bool:
-        """Switch to next available API key. Returns True if successful."""
-        self.current_key_index += 1
-        if self.current_key_index >= len(self.api_keys):
-            return False
-        self._initialize_client()
-        return True
+        self.youtube_client = build(
+            "youtube", "v3", developerKey=self.api_keys[self.current_key_index]
+        )
+
+    def _restore_expired_quota_keys(self) -> None:
+        """Check for and restore any keys whose quota should have reset."""
+        current_time = time.time()
+        restored_keys = []
+
+        for key_idx, exceeded_time in list(self.quota_exceeded_keys.items()):
+            # If enough time has passed since quota was exceeded
+            if current_time - exceeded_time > self.quota_reset_period:
+                self.available_keys.append(key_idx)
+                restored_keys.append(key_idx)
+
+        # Remove restored keys from the exceeded list
+        for key_idx in restored_keys:
+            del self.quota_exceeded_keys[key_idx]
+
+        if restored_keys:
+            print(f"Restored {len(restored_keys)} API keys with reset quota")
+
+    def _mark_key_quota_exceeded(self) -> None:
+        """Mark current key as having exceeded quota and select next key."""
+        if self.current_key_index is not None:
+            # Move from available to quota exceeded
+            self.available_keys.remove(self.current_key_index)
+            self.quota_exceeded_keys[self.current_key_index] = time.time()
+            self.key_failure_count[self.current_key_index] += 1
+
+            print(f"API key {self.current_key_index + 1} marked as quota exceeded")
+
+            # Select next key
+            if self.available_keys:
+                self.current_key_index = self.available_keys[0]
+                self._initialize_client()
+            else:
+                # No available keys, force check for restored keys
+                self._restore_expired_quota_keys()
+                if self.available_keys:
+                    self.current_key_index = self.available_keys[0]
+                    self._initialize_client()
+                else:
+                    self.current_key_index = None
 
     def get_client(self):
-        """Get current YouTube client."""
+        """Get current YouTube client, ensuring a valid one is available."""
+        if self.current_key_index is None or self.youtube_client is None:
+            self._restore_expired_quota_keys()
+            if self.available_keys:
+                self.current_key_index = self.available_keys[0]
+                self._initialize_client()
+            else:
+                raise Exception("All API keys have exceeded their quota")
+
+        # Track usage
+        self.key_usage_count[self.current_key_index] += 1
         return self.youtube_client
 
     async def execute_with_retry(self, operation):
-        """Execute YouTube API operation with automatic key switching on quota exceeded."""
-        max_retries = len(self.api_keys)
-        retries = 0
+        """Execute YouTube API operation with efficient key rotation on quota exceeded."""
+        # First, make sure we have an available key
+        if not self.available_keys:
+            self._restore_expired_quota_keys()
+            if not self.available_keys:
+                raise Exception(
+                    "All API keys have exceeded their quota. Please try again later."
+                )
 
-        while retries < max_retries:
+        # Try all possible keys
+        initial_key_count = len(self.available_keys)
+        attempts = 0
+
+        while attempts < initial_key_count:
             try:
-                return await operation(self.youtube_client)
+                # Get a fresh client with the current best key
+                client = self.get_client()
+                return await operation(client)
             except HttpError as e:
                 if e.resp.status in [403, 429] and "quota" in str(e).lower():
-                    print(
-                        f"Quota exceeded for key {self.current_key_index + 1}, switching to next key..."
-                    )
-                    if not self.switch_to_next_key():
+                    print(f"Quota exceeded for key {self.current_key_index + 1}")
+                    self._mark_key_quota_exceeded()
+                    attempts += 1
+
+                    # If we've exhausted all keys, raise exception
+                    if not self.available_keys:
                         raise Exception("All API keys have exceeded their quota")
-                    retries += 1
                 else:
+                    # Other API error, not quota-related
                     raise e
             except Exception as e:
                 raise e
 
-        raise Exception("All API keys have been exhausted")
+        raise Exception("All available API keys failed")
+
+    def get_key_stats(self):
+        """Return statistics about key usage for monitoring."""
+        return {
+            "available_keys": len(self.available_keys),
+            "quota_exceeded_keys": len(self.quota_exceeded_keys),
+            "current_key": self.current_key_index,
+            "usage_stats": self.key_usage_count,
+            "failure_stats": self.key_failure_count,
+        }
 
 
 app = FastAPI()
@@ -158,6 +226,7 @@ async def process_video(
     publish_after: Optional[datetime] = None,
     publish_before: Optional[datetime] = None,
     country_code: Optional[str] = None,
+    excluded_channels: Optional[List[str]] = None,  # New parameter
 ) -> None:
     """
     Process a single video and add it to all_videos if relevant.
@@ -173,26 +242,62 @@ async def process_video(
                 and (not country_code or cached_video.country == country_code)
             ):
 
+                # Check if excluded_channels parameter is provided and if this channel should be excluded
+                if excluded_channels and any(
+                    excluded.lower() in cached_video.channelTitle.lower()
+                    for excluded in excluded_channels
+                ):
+                    return
+
                 # Check date filters if applicable
                 if publish_after or publish_before:
                     try:
                         from datetime import timezone
 
-                        publish_time = datetime.fromisoformat(
-                            cached_video.publishTime.replace("Z", "+00:00")
-                        )
+                        # Parse the cached video's publish time
+                        publish_time_str = cached_video.publishTime
+                        if publish_time_str:
+                            # Normalize the format by removing 'Z' and adding timezone info
+                            if publish_time_str.endswith("Z"):
+                                publish_time_str = publish_time_str[:-1] + "+00:00"
 
-                        if publish_after and publish_after.tzinfo is None:
-                            publish_after = publish_after.replace(tzinfo=timezone.utc)
-                        if publish_before and publish_before.tzinfo is None:
-                            publish_before = publish_before.replace(tzinfo=timezone.utc)
+                            # Parse to datetime object
+                            publish_time = datetime.fromisoformat(publish_time_str)
 
-                        if (publish_after and publish_time < publish_after) or (
-                            publish_before and publish_time > publish_before
-                        ):
-                            return
+                            # Make dates timezone aware
+                            if publish_after and publish_after.tzinfo is None:
+                                publish_after = publish_after.replace(
+                                    tzinfo=timezone.utc
+                                )
+
+                            if publish_before and publish_before.tzinfo is None:
+                                publish_before = publish_before.replace(
+                                    tzinfo=timezone.utc
+                                )
+
+                            # Compare dates
+                            if publish_after and publish_time < publish_after:
+                                return
+
+                            if publish_before and publish_time > publish_before:
+                                return
                     except Exception as e:
                         print(f"Error parsing cached publish date: {str(e)}")
+
+                # Update keyword presence flags for cached videos
+                title_lower = cached_video.title.lower()
+                description_lower = cached_video.description.lower()
+
+                import re
+
+                cached_video.has_keyword_in_title = any(
+                    re.search(r"\b" + re.escape(keyword) + r"\b", title_lower)
+                    for keyword in keywords
+                )
+                cached_video.has_keyword_in_description = any(
+                    re.search(r"\b" + re.escape(keyword) + r"\b", description_lower)
+                    for keyword in keywords
+                )
 
                 all_videos.append(cached_video)
                 return
@@ -224,10 +329,12 @@ async def process_video(
                     # Ensure consistent timezone handling - make both dates timezone-aware
                     from datetime import timezone
 
+                    # Normalize the format by removing 'Z' and adding timezone info
+                    if publish_time_str.endswith("Z"):
+                        publish_time_str = publish_time_str[:-1] + "+00:00"
+
                     # Parse the video's publish time
-                    publish_time = datetime.fromisoformat(
-                        publish_time_str.replace("Z", "+00:00")
-                    )
+                    publish_time = datetime.fromisoformat(publish_time_str)
 
                     # Make sure publish_after and publish_before are timezone-aware
                     if publish_after and publish_after.tzinfo is None:
@@ -291,6 +398,13 @@ async def process_video(
         if any(kw in channel_title for kw in keywords):
             return
 
+        # Check if channel is in the excluded list (case-insensitive)
+        if excluded_channels and any(
+            excluded.lower() in channel_title.lower() for excluded in excluded_channels
+        ):
+            print(f"Skipping video from excluded channel: {channel_title}")
+            return
+
         try:
 
             async def get_channel_details(youtube):
@@ -317,6 +431,20 @@ async def process_video(
         except:
             duration = "PT0S"  # Default duration if not available
 
+        title_lower = video_data["snippet"].get("title", "").lower()
+        description_lower = description.lower()
+
+        import re
+
+        has_keyword_in_title = any(
+            re.search(r"\b" + re.escape(keyword) + r"\b", title_lower)
+            for keyword in keywords
+        )
+        has_keyword_in_description = any(
+            re.search(r"\b" + re.escape(keyword) + r"\b", description_lower)
+            for keyword in keywords
+        )
+
         # Create video details
         video_details = VideoDetails(
             videoId=video_id,
@@ -335,7 +463,9 @@ async def process_video(
             channelLink=f"https://www.youtube.com/channel/{channel_id}",
             relevancy_score=relevancy_score,
             brand_links=brand_links,
-            country=video_country,  # Add country info to the VideoDetails
+            country=video_country,
+            has_keyword_in_title=has_keyword_in_title,  # Add the new field
+            has_keyword_in_description=has_keyword_in_description,  # Add the new field
         )
 
         cache.store_video(video_details)
@@ -358,6 +488,8 @@ async def search_videos(payload: SearchRequest):
         payload_dict["custom_date_from"] = payload_dict["custom_date_from"].isoformat()
     if payload_dict.get("custom_date_to"):
         payload_dict["custom_date_to"] = payload_dict["custom_date_to"].isoformat()
+
+    payload_dict["keyword_filter_explicit"] = str(payload.keyword_filter)
 
     # Create a consistent string representation and hash it
     payload_str = json.dumps(payload_dict, sort_keys=True)
@@ -385,6 +517,13 @@ async def search_videos(payload: SearchRequest):
         print(f"Error checking cache: {str(e)}")
 
     # If we reach here, it's a cache miss - execute the regular search logic
+
+    # Get the excluded channels list (convert to lowercase for case-insensitive matching)
+    excluded_channels = (
+        [channel.strip() for channel in payload.excluded_channels]
+        if payload.excluded_channels
+        else []
+    )
 
     try:
         if not youtube_manager.api_keys:
@@ -422,11 +561,16 @@ async def search_videos(payload: SearchRequest):
         if payload.date_filter != DateFilterOption.ALL_TIME:
             if payload.date_filter == DateFilterOption.CUSTOM:
                 if payload.custom_date_from:
-                    publish_after_str = payload.custom_date_from.isoformat() + "Z"
+                    # Format correctly for YouTube API (RFC 3339 format)
                     publish_after_dt = payload.custom_date_from
+                    # Remove the trailing 'Z' and properly format without milliseconds
+                    publish_after_str = publish_after_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
                 if payload.custom_date_to:
-                    publish_before_str = payload.custom_date_to.isoformat() + "Z"
                     publish_before_dt = payload.custom_date_to
+                    # Remove the trailing 'Z' and properly format without milliseconds
+                    publish_before_str = publish_before_dt.strftime(
+                        "%Y-%m-%dT%H:%M:%SZ"
+                    )
             else:
                 # Calculate publish dates based on filter option
                 if payload.date_filter == DateFilterOption.PAST_HOUR:
@@ -450,7 +594,7 @@ async def search_videos(payload: SearchRequest):
 
                 # Create string format for YouTube API
                 if publish_after_dt:
-                    publish_after_str = publish_after_dt.isoformat() + "Z"
+                    publish_after_str = publish_after_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
         # Clean and split keywords
         keywords = [
@@ -516,6 +660,7 @@ async def search_videos(payload: SearchRequest):
                                         publish_after_dt,
                                         publish_before_dt,
                                         payload.country_code,
+                                        excluded_channels,  # Pass the excluded channels list
                                     )
                                 )
 
@@ -557,6 +702,7 @@ async def search_videos(payload: SearchRequest):
                                                     publish_after_dt,
                                                     publish_before_dt,
                                                     payload.country_code,
+                                                    excluded_channels,  # Pass the excluded channels list
                                                 )
                                             )
 
@@ -586,11 +732,50 @@ async def search_videos(payload: SearchRequest):
         # Execute all tasks
         await asyncio.gather(*tasks)
 
-        # Sort videos by relevancy score and view count
-        all_videos.sort(key=lambda x: (x.relevancy_score, x.viewCount), reverse=True)
+        print(f"Initial video count: {len(all_videos)}")
+
+        for i, video in enumerate(all_videos[:5]):
+            print(
+                f"Sample video {i}: '{video.title}' - Title has keyword: {video.has_keyword_in_title}, Description has keyword: {video.has_keyword_in_description}"
+            )
+
+        # Apply keyword location filter
+        filtered_videos = []
+        for video in all_videos:
+            include_video = False
+
+            if payload.keyword_filter == KeywordFilterOption.ANY:
+                # Default behavior - include all videos that passed the relevancy check
+                include_video = True
+            elif payload.keyword_filter == KeywordFilterOption.TITLE_ONLY:
+                # Only include if keyword is in title BUT NOT in description
+                include_video = (
+                    video.has_keyword_in_title and not video.has_keyword_in_description
+                )
+            elif payload.keyword_filter == KeywordFilterOption.DESCRIPTION_ONLY:
+                # Only include if keyword is in description BUT NOT in title
+                include_video = (
+                    video.has_keyword_in_description and not video.has_keyword_in_title
+                )
+            elif payload.keyword_filter == KeywordFilterOption.TITLE_AND_DESCRIPTION:
+                # Must be in both title AND description
+                include_video = (
+                    video.has_keyword_in_title and video.has_keyword_in_description
+                )
+            if include_video:
+                filtered_videos.append(video)
+
+        print(f"After {payload.keyword_filter} filtering: {len(filtered_videos)}")
+
+        # Sort the filtered videos
+        filtered_videos.sort(
+            key=lambda x: (x.relevancy_score, x.viewCount), reverse=True
+        )
 
         # Return exactly max_results videos or all available if less than max_results
-        final_results = all_videos[: payload.max_results] if all_videos else []
+        final_results = (
+            filtered_videos[: payload.max_results] if filtered_videos else []
+        )
 
         # Cache the results before returning
         try:

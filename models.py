@@ -39,15 +39,14 @@ class SearchRequest(BaseModel):
 class VideoDetails(BaseModel):
     videoId: str
     title: str
+    description: str
     channelTitle: str
     channelId: str
     publishTime: str
     viewCount: Optional[int] = 0
     likeCount: Optional[int] = 0
-    commentCount: Optional[int] = 0
     subscriberCount: Optional[int] = 0
     duration: Optional[str] = None
-    description: str
     thumbnails: Dict[str, Any]
     videoLink: str
     channelLink: Optional[str]
@@ -56,3 +55,4 @@ class VideoDetails(BaseModel):
     country: Optional[str] = None  
     has_keyword_in_title: bool = False  # New field: indicates if keyword is in title
     has_keyword_in_description: bool = False  # New field: indicates if keyword is in description
+    has_sponsored_links: bool = False

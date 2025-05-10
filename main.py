@@ -17,7 +17,13 @@ from youtube_manager import YouTubeAPIManager
 from video_processor import process_video, parse_duration
 from cache import RedisCache
 from models import SearchRequest, VideoDetails, DateFilterOption, KeywordFilterOption
-from utils import extract_video_id_from_url, calculate_relevancy_score, extract_brand_related_urls
+from utils import (
+    extract_video_id_from_url,
+    calculate_relevancy_score,
+    extract_brand_related_urls,
+)
+import pandas as pd
+
 
 load_dotenv()
 
@@ -94,615 +100,936 @@ app.add_middleware(
 
 
 @cache.cached(expire=1800)
-@app.post("/search", response_model=List[VideoDetails])
-async def search_videos(payload: SearchRequest):
+@app.post("/search", response_model=List[dict])
+async def search_videos_snippet_only(payload: SearchRequest):
     start_time = time.time()
 
-    # Generate a cache key based on the exact search parameters
+    # Generate cache key
     payload_dict = payload.model_dump()
-    # Convert datetime objects to strings for consistent serialization
+
+    def json_serializable(obj):
+        if isinstance(obj, datetime):
+            return obj.isoformat()
+        raise TypeError(f"Type {type(obj)} not serializable")
+
+    # Handle datetime objects for caching
     if payload_dict.get("custom_date_from"):
         payload_dict["custom_date_from"] = payload_dict["custom_date_from"].isoformat()
     if payload_dict.get("custom_date_to"):
         payload_dict["custom_date_to"] = payload_dict["custom_date_to"].isoformat()
 
-    payload_dict["keyword_filter_explicit"] = str(payload.keyword_filter)
-
-    # Create a consistent string representation and hash it
-    payload_str = json.dumps(payload_dict, sort_keys=True)
+    payload_str = json.dumps(payload_dict, sort_keys=True, default=json_serializable)
     cache_key = f"search:{hashlib.md5(payload_str.encode()).hexdigest()}"
-
     print(f"Search cache key: {cache_key}")
 
-    # Try to get complete results from cache
+    # Try to get results from cache
     try:
         cached_data = redis_client.get(cache_key)
         if cached_data:
-            print(f"🎉 CACHE HIT! Returning cached results")
-            # Deserialize the cached data
-            results_dict = json.loads(cached_data)
-            results = [VideoDetails(**item) for item in results_dict]
-
-            # Log performance
+            print("🎉 CACHE HIT! Returning cached results")
+            results = json.loads(cached_data)
             elapsed = time.time() - start_time
             print(f"Cache hit response time: {elapsed:.4f} seconds")
-
-            return results
+            return results[: payload.max_results]
         else:
             print("Cache miss, performing search...")
     except Exception as e:
         print(f"Error checking cache: {str(e)}")
 
-    # If we reach here, it's a cache miss - execute the regular search logic
+    # Extract brand name keywords for searching
+    keywords = [
+        kw.strip().lower() for kw in payload.brand_name.split(",") if kw.strip()
+    ]
+    brand_key = "_".join(keywords)
 
-    # Get the excluded channels list (convert to lowercase for case-insensitive matching)
-    excluded_channels = (
-        [channel.strip() for channel in payload.excluded_channels]
-        if payload.excluded_channels
-        else []
+    # Define CSV filename based on brand name
+    csv_filename = f"videos_data_{brand_key}.csv"
+
+    # ---- DYNAMIC COLLECTION TARGET BASED ON MAX_RESULTS ----
+    if payload.max_results <= 50:
+        COLLECTION_TARGET = 500
+    elif 50 < payload.max_results <= 200:
+        COLLECTION_TARGET = 1000
+    elif 200 < payload.max_results <= 300:
+        COLLECTION_TARGET = 1500
+    else:
+        COLLECTION_TARGET = 2000
+
+    print(
+        f"Setting collection target to {COLLECTION_TARGET} videos for max_results={payload.max_results}"
     )
 
-    try:
-        if not youtube_manager.api_keys:
-            raise HTTPException(
-                status_code=500,
-                detail="No YouTube API keys available. Please check environment variables.",
+    # First, check if we already have data for this brand
+    if os.path.exists(csv_filename):
+        print(f"Found existing data file for {brand_key}. Loading from CSV...")
+        try:
+            # Load data from CSV using pandas
+            data_loading_start = time.time()
+            df = pd.read_csv(csv_filename)
+
+            # Ensure all string columns are actually strings, not floats
+            string_columns = [
+                "brand_links_str",
+                "description",
+                "title",
+                "channelTitle",
+                "country",
+            ]
+            for col in string_columns:
+                if col in df.columns:
+                    df[col] = df[col].fillna("").astype(str)
+
+            print(
+                f"Loaded {len(df)} records from CSV in {time.time() - data_loading_start:.2f}s"
             )
 
-        if not GOOGLE_CSE_API_KEY or not GOOGLE_CSE_ID:
-            raise HTTPException(
-                status_code=500,
-                detail="Missing Google CSE credentials. Please check environment variables.",
-            )
+            # Apply filters to the loaded data
+            try:
+                filtered_results = apply_filters(df, payload)
 
-        google_cse = google_build("customsearch", "v1", developerKey=GOOGLE_CSE_API_KEY)
-
-        country_code = None
-        if (
-            payload.country_code
-            and payload.country_code.lower() != "string"
-            and len(payload.country_code) == 2
-        ):
-            country_code = payload.country_code.upper()
-
-        # Initialize string format dates for YouTube API
-        publish_after_str = None
-        publish_before_str = None
-
-        # Initialize datetime objects for process_video function
-        publish_after_dt = None
-        publish_before_dt = None
-
-        now = datetime.utcnow()
-
-        if payload.date_filter != DateFilterOption.ALL_TIME:
-            if payload.date_filter == DateFilterOption.CUSTOM:
-                if payload.custom_date_from:
-                    # Format correctly for YouTube API (RFC 3339 format)
-                    publish_after_dt = payload.custom_date_from
-                    # Remove the trailing 'Z' and properly format without milliseconds
-                    publish_after_str = publish_after_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-                if payload.custom_date_to:
-                    publish_before_dt = payload.custom_date_to
-                    # Remove the trailing 'Z' and properly format without milliseconds
-                    publish_before_str = publish_before_dt.strftime(
-                        "%Y-%m-%dT%H:%M:%SZ"
+                # Cache the filtered results
+                try:
+                    serialized_data = json.dumps(
+                        filtered_results, default=json_serializable
                     )
-            else:
-                # Calculate publish dates based on filter option
-                if payload.date_filter == DateFilterOption.PAST_HOUR:
-                    publish_after_dt = now - timedelta(hours=1)
-                elif payload.date_filter == DateFilterOption.PAST_3_HOURS:
-                    publish_after_dt = now - timedelta(hours=3)
-                elif payload.date_filter == DateFilterOption.PAST_6_HOURS:
-                    publish_after_dt = now - timedelta(hours=6)
-                elif payload.date_filter == DateFilterOption.PAST_12_HOURS:
-                    publish_after_dt = now - timedelta(hours=12)
-                elif payload.date_filter == DateFilterOption.PAST_24_HOURS:
-                    publish_after_dt = now - timedelta(days=1)
-                elif payload.date_filter == DateFilterOption.PAST_7_DAYS:
-                    publish_after_dt = now - timedelta(days=7)
-                elif payload.date_filter == DateFilterOption.PAST_30_DAYS:
-                    publish_after_dt = now - timedelta(days=30)
-                elif payload.date_filter == DateFilterOption.PAST_90_DAYS:
-                    publish_after_dt = now - timedelta(days=90)
-                elif payload.date_filter == DateFilterOption.PAST_180_DAYS:
-                    publish_after_dt = now - timedelta(days=180)
+                    redis_client.setex(cache_key, 3600, serialized_data)
+                    print(f"✅ Cached {len(filtered_results)} filtered results")
+                except Exception as e:
+                    print(f"Error caching filtered results: {str(e)}")
 
-                # Create string format for YouTube API
-                if publish_after_dt:
-                    publish_after_str = publish_after_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+                return filtered_results
+            except Exception as e:
+                import traceback
 
-        # Clean and split keywords
-        keywords = [
-            keyword.strip().lower()
-            for keyword in payload.brand_name.split(",")
-            if keyword.strip()
-        ]
+                print(f"Error applying filters: {str(e)}")
+                print(traceback.format_exc())
+                # Continue to collect new data
 
-        all_videos = []
-        seen_video_ids = set()
-        tasks = []
-        valid_video_count = 0
+        except Exception as e:
+            print(f"Error loading from CSV: {str(e)}. Will collect new data.")
 
-        # Constants for search optimization
-        MAX_SEARCH_MULTIPLIER = 10  # Higher multiplier to find more videos
-        MAX_ATTEMPTS = 3
+    all_results = []
+    seen_video_ids = set()
 
-        # ===== PHASE 1: COLLECT CANDIDATE VIDEO IDS =====
-        print("Phase 1: Collecting candidate videos...")
-        phase1_start = time.time()
+    # Search query variations
+    query_templates = [
+        '"{}" brand',
+        '"{}"',
+        '"{}" review',
+        '"{}" tutorial',
+        '"{}" guide',
+        '"{}" how to',
+        '"{}" app',
+        '"{}" demo',
+        '"{}" explained',
+    ]
 
-        for attempt in range(MAX_ATTEMPTS):
-            if len(seen_video_ids) >= payload.max_results * MAX_SEARCH_MULTIPLIER:
+    # Search phase start time
+    search_start = time.time()
+
+    try:
+        # Run searches until we collect enough videos
+        for keyword in keywords:
+            if len(all_results) >= COLLECTION_TARGET:
                 break
 
-            for keyword in keywords:
-                if len(seen_video_ids) >= payload.max_results * MAX_SEARCH_MULTIPLIER:
+            print(f"Processing keyword: {keyword}")
+
+            for template in query_templates:
+                if len(all_results) >= COLLECTION_TARGET:
                     break
 
-                # More comprehensive search queries
-                youtube_search_queries = [
-                    f'"{keyword}"',
-                    f'"{keyword}" review',
-                    f'"{keyword}" tutorial',
-                    f'"{keyword}" guide',
-                    f'"{keyword}" how to',
-                    f'"{keyword}" app',
-                    f'"{keyword}" demo',
-                    f'"{keyword}" explained',
-                ]
+                query = template.format(keyword)
+                print(f"Searching for: {query}")
 
-                needed_videos = max(
-                    payload.max_results * MAX_SEARCH_MULTIPLIER - len(seen_video_ids),
-                    50,
-                )
+                # Track pagination
+                next_page_token = None
+                page_count = 0
 
-                for query in youtube_search_queries:
-                    if (
-                        len(seen_video_ids)
-                        >= payload.max_results * MAX_SEARCH_MULTIPLIER
-                    ):
-                        break
+                # Get up to 5 pages of results per query
+                while page_count < 5 and len(all_results) < COLLECTION_TARGET:
+                    page_count += 1
 
                     try:
-
-                        async def search_videos(youtube):
-                            search_params = {
+                        # Define the search request
+                        async def run_search(youtube):
+                            params = {
                                 "q": query,
-                                "part": "id",  # Only need IDs in first phase
-                                "maxResults": min(needed_videos, 50),
+                                "part": "snippet",
+                                "maxResults": 50,
                                 "type": "video",
-                                "safeSearch": "none",
                                 "relevanceLanguage": "en",
                             }
+                            if next_page_token:
+                                params["pageToken"] = next_page_token
+                            return youtube.search().list(**params).execute()
 
-                            # Add date filters to YouTube API call if specified
-                            if publish_after_str:
-                                search_params["publishedAfter"] = publish_after_str
-                            if publish_before_str:
-                                search_params["publishedBefore"] = publish_before_str
-
-                            # Add region code if specified (search within country)
-                            if payload.country_code:
-                                search_params["regionCode"] = country_code
-
-                            return youtube.search().list(**search_params).execute()
-
+                        # Execute the search
                         search_response = await youtube_manager.execute_with_retry(
-                            search_videos
+                            run_search, "search.list"
                         )
 
-                        for item in search_response.get("items", []):
+                        # Process results
+                        items = search_response.get("items", [])
+                        next_page_token = search_response.get("nextPageToken")
+
+                        print(f"Found {len(items)} results on page {page_count}")
+
+                        # Extract data from each result
+                        for item in items:
                             video_id = item["id"].get("videoId")
-                            if video_id and video_id not in seen_video_ids:
-                                seen_video_ids.add(video_id)
 
-                    except Exception as e:
-                        print(f"YouTube API search error: {str(e)}")
+                            # Skip if we've seen this video before
+                            if not video_id or video_id in seen_video_ids:
+                                continue
 
-                # Google Custom Search - more efficient version
-                if (
-                    GOOGLE_CSE_API_KEY
-                    and GOOGLE_CSE_ID
-                    and len(seen_video_ids)
-                    < payload.max_results * MAX_SEARCH_MULTIPLIER
-                ):
-                    google_search_queries = [
-                        f'site:youtube.com "{keyword}"',
-                        f'site:youtube.com/watch "{keyword}"',
-                        f"site:youtube.com {keyword} review",
-                        f"site:youtube.com {keyword} tutorial",
-                    ]
+                            seen_video_ids.add(video_id)
 
-                    for query in google_search_queries:
-                        if (
-                            len(seen_video_ids)
-                            >= payload.max_results * MAX_SEARCH_MULTIPLIER
-                        ):
-                            break
+                            # Extract snippet data
+                            snippet = item.get("snippet", {})
+                            title = snippet.get("title", "")
+                            description = snippet.get("description", "")
+                            channel_title = snippet.get("channelTitle", "")
+                            channel_id = snippet.get("channelId", "")
 
-                        try:
-                            # Only do 3 pages per query for speed
-                            for start_index in range(1, 31, 10):
-                                if (
-                                    len(seen_video_ids)
-                                    >= payload.max_results * MAX_SEARCH_MULTIPLIER
-                                ):
+                            # IMPROVED RELEVANCY CHECK using word boundaries (from the old code)
+                            title_lower = title.lower()
+                            description_lower = description.lower()
+
+                            # Check for exact keyword matches with word boundaries
+                            import re
+
+                            has_keyword_in_title = any(
+                                re.search(r"\b" + re.escape(kw) + r"\b", title_lower)
+                                for kw in keywords
+                            )
+                            has_keyword_in_description = any(
+                                re.search(
+                                    r"\b" + re.escape(kw) + r"\b", description_lower
+                                )
+                                for kw in keywords
+                            )
+
+                            # Skip if not relevant (improved filtering)
+                            if not (has_keyword_in_title or has_keyword_in_description):
+                                continue
+
+                            # IMPROVED OFFICIAL CHANNEL DETECTION
+                            # Skip if this is likely the brand's official channel
+                            is_official = False
+                            for kw in keywords:
+                                # Exact match for channel name
+                                if channel_title.lower() == kw:
+                                    is_official = True
                                     break
 
-                                try:
-                                    search_results = (
-                                        google_cse.cse()
-                                        .list(
-                                            q=query, cx=GOOGLE_CSE_ID, start=start_index
-                                        )
-                                        .execute()
-                                    )
+                                # Common official channel patterns
+                                official_patterns = [
+                                    f"{kw} official",
+                                    f"official {kw}",
+                                    f"{kw}.com",
+                                    f"{kw} app",
+                                    f"{kw}app",
+                                    f"{kw} official channel",
+                                ]
 
-                                    for item in search_results.get("items", []):
-                                        video_id = extract_video_id_from_url(
-                                            item["link"]
-                                        )
-                                        if video_id and video_id not in seen_video_ids:
-                                            seen_video_ids.add(video_id)
+                                if any(
+                                    pattern in channel_title.lower()
+                                    for pattern in official_patterns
+                                ):
+                                    is_official = True
+                                    break
 
-                                except HttpError as e:
-                                    if e.resp.status in [403, 429]:
-                                        break
-                                    else:
-                                        continue
+                            if is_official:
+                                # print(
+                                #     f"Skipping official channel video: {title} ({channel_title})"
+                                # )
+                                continue
 
-                        except Exception as e:
-                            print(f"Error in Google CSE search: {str(e)}")
+                            video_link = f"https://www.youtube.com/watch?v={video_id}"
+                            channel_link = (
+                                f"https://www.youtube.com/channel/{channel_id}"
+                            )
 
-            # If we have enough videos, break out of the attempts loop
-            if len(seen_video_ids) >= payload.max_results * 3:
-                break
+                            # Create a clean result object with only the fields we want
+                            result = {
+                                "videoId": video_id,
+                                "title": title,
+                                "description": description,
+                                "publishTime": snippet.get("publishedAt", ""),
+                                "channelId": channel_id,
+                                "channelTitle": channel_title,
+                                "thumbnails": snippet.get("thumbnails", {}),
+                                "viewCount": 0,
+                                "likeCount": 0,
+                                "commentCount": 0,
+                                "subscriberCount": 0,
+                                "duration": "",
+                                "durationSeconds": 0,
+                                "country": "",
+                                "videoLink": video_link,
+                                "channelLink": channel_link,
+                                "brand_links": [],
+                                "has_keyword_in_title": has_keyword_in_title,
+                                "has_keyword_in_description": has_keyword_in_description,
+                                "has_sponsored_links": False,
+                                "relevancy_score": 0,  # Will be calculated in Phase 2
+                            }
 
-            # If we're not finding enough videos, try expanded search terms
-            if attempt > 0 and len(seen_video_ids) < payload.max_results * 2:
-                print(
-                    f"Expanded search attempt {attempt+1} - found {len(seen_video_ids)} candidates so far"
-                )
-                expanded_keywords = []
-                for keyword in keywords:
-                    expanded_keywords.extend(
-                        [
-                            f"{keyword} best",
-                            f"{keyword} app",
-                            f"{keyword} recommended",
-                            f"using {keyword}",
-                        ]
-                    )
-                # Add expanded keywords to our search
-                keywords.extend(expanded_keywords)
+                            all_results.append(result)
 
-        phase1_time = time.time() - phase1_start
+                        # If no more pages or we have enough videos, stop pagination
+                        if not next_page_token or len(all_results) >= COLLECTION_TARGET:
+                            break
+
+                    except Exception as e:
+                        print(
+                            f"Error on page {page_count} for query '{query}': {str(e)}"
+                        )
+                        break
+
+        # Search phase complete
+        search_time = time.time() - search_start
         print(
-            f"Phase 1 complete: Found {len(seen_video_ids)} candidate videos in {phase1_time:.2f}s"
+            f"Phase 1 complete: collected {len(all_results)} videos in {search_time:.2f} seconds"
         )
 
-        # ===== PHASE 2: PROCESS VIDEOS IN BATCHES =====
-        print("Phase 2: Processing videos in batches...")
-        phase2_start = time.time()
+        # ===== PHASE 2: Get Video Details (Duration and View Count) CONCURRENTLY =====
+        details_start = time.time()
 
-        # Process videos in batches of 50 where possible
-        video_id_list = list(seen_video_ids)
+        # Create a video ID to index mapping for quick updates
+        video_id_to_index = {video["videoId"]: i for i, video in enumerate(all_results)}
 
-        # First try to process videos in batches (more efficient)
-        for i in range(0, len(video_id_list), 50):
-            batch_ids = video_id_list[i : i + 50]
+        # Process in batches of 50 (YouTube API maximum)
+        video_ids = list(seen_video_ids)
 
-            # Skip if we have enough videos already
-            if len(all_videos) >= payload.max_results * 2:
-                break
+        # Create batches of 50 videos
+        batches = []
+        for i in range(0, len(video_ids), 50):
+            batches.append(video_ids[i : i + 50])
+
+        total_batches = len(batches)
+        print(
+            f"Phase 2: Fetching details for {len(video_ids)} videos in {total_batches} concurrent batches"
+        )
+
+        # Define a function to process one batch
+        async def process_batch(batch_id, video_batch):
+            batch_start = time.time()
 
             try:
-                # Get details for up to 50 videos at once
-                async def get_videos_batch(youtube):
+                # Fetch details for this batch
+                async def get_video_details(youtube):
                     return (
                         youtube.videos()
                         .list(
-                            part="snippet,contentDetails,statistics,recordingDetails",
-                            id=",".join(batch_ids),
+                            part="contentDetails,statistics", id=",".join(video_batch)
                         )
                         .execute()
                     )
 
-                batch_response = await youtube_manager.execute_with_retry(
-                    get_videos_batch
+                details_response = await youtube_manager.execute_with_retry(
+                    get_video_details, "videos.list"
                 )
 
-                # Gather unique channel IDs from this batch
-                channel_ids = []
-                channel_map = {}
+                # Process the batch results
+                batch_results = {}  # Store results to update atomically later
 
-                # First pass - extract channels and check basic criteria
-                valid_videos_data = []
+                for item in details_response.get("items", []):
+                    video_id = item["id"]
 
-                for video_data in batch_response.get("items", []):
-                    # Check view count meets minimum
-                    view_count = int(video_data["statistics"].get("viewCount", 0))
-                    if view_count < payload.min_views:
-                        continue
+                    # Extract content details and statistics
+                    content_details = item.get("contentDetails", {})
+                    statistics = item.get("statistics", {})
+                    snippet = item.get("snippet", {})
 
-                    # Check duration meets minimum (60 seconds)
+                    # Get ISO 8601 duration
+                    duration = content_details.get("duration", "PT0S")
+                    view_count = int(statistics.get("viewCount", 0))
+                    like_count = int(statistics.get("likeCount", 0))
+
+                    relevancy_score = calculate_relevancy_score(
+                        {"snippet": snippet}, keywords
+                    )
+
+                    # Convert to seconds
                     try:
-                        duration = video_data["contentDetails"]["duration"]
                         duration_seconds = parse_duration(duration)
-                        if duration_seconds < 60:
-                            continue
-                    except:
-                        continue
+                    except Exception:
+                        duration_seconds = 0
 
-                    # Calculate relevancy score
-                    relevancy_score = calculate_relevancy_score(video_data, keywords)
-                    if relevancy_score < 3:
-                        continue
+                    # Store in batch results
+                    batch_results[video_id] = {
+                        "duration": duration,
+                        "durationSeconds": duration_seconds,
+                        "viewCount": view_count,
+                        "likeCount": like_count,
+                        "relevancy_score": relevancy_score,
+                    }
 
-                    # Check channel name against excluded list
-                    channel_title = video_data["snippet"]["channelTitle"].lower()
-                    if any(
-                        excluded.lower() in channel_title
-                        for excluded in excluded_channels
-                    ):
-                        continue
+                batch_time = time.time() - batch_start
+                print(
+                    f"✅ Batch {batch_id+1}/{total_batches} completed in {batch_time:.2f}s"
+                )
 
-                    # Skip if channel name contains any of the keywords
-                    if any(kw in channel_title for kw in keywords):
-                        continue
-
-                    # Store channel ID for batch processing
-                    channel_id = video_data["snippet"]["channelId"]
-                    if channel_id not in channel_map:
-                        channel_ids.append(channel_id)
-                        channel_map[channel_id] = []
-
-                    # Add to list of videos sharing this channel
-                    channel_map[channel_id].append(video_data)
-                    valid_videos_data.append(video_data)
-
-                # If we have valid videos, fetch their channels in a batch
-                if channel_ids:
-                    # Process channels in batches of 50
-                    channel_stats = {}
-                    for j in range(0, len(channel_ids), 50):
-                        channel_batch = channel_ids[j : j + 50]
-
-                        async def get_channels_batch(youtube):
-                            return (
-                                youtube.channels()
-                                .list(part="statistics", id=",".join(channel_batch))
-                                .execute()
-                            )
-
-                        channels_response = await youtube_manager.execute_with_retry(
-                            get_channels_batch
-                        )
-
-                        # Map channel stats by ID
-                        for channel in channels_response.get("items", []):
-                            channel_stats[channel["id"]] = channel.get("statistics", {})
-
-                    # Now create video details objects
-                    for video_data in valid_videos_data:
-                        video_id = video_data["id"]
-                        channel_id = video_data["snippet"]["channelId"]
-
-                        # Extract info needed for VideoDetails
-                        description = video_data["snippet"].get("description", "")
-                        brand_links = extract_brand_related_urls(description, keywords)
-
-                        # Extract country information
-                        video_country = None
-                        recording_details = video_data.get("recordingDetails", {})
-                        if recording_details and recording_details.get(
-                            "locationDescription"
-                        ):
-                            location_desc = recording_details.get(
-                                "locationDescription", ""
-                            )
-                            video_country = (
-                                location_desc.split(",")[-1].strip()
-                                if "," in location_desc
-                                else location_desc
-                            )
-
-                        # Also check snippet country
-                        snippet_country = video_data.get("snippet", {}).get("country")
-                        if snippet_country:
-                            video_country = snippet_country
-
-                        # Check if country code filter matches
-                        if (
-                            country_code
-                            and video_country
-                            and video_country.upper() != country_code.upper()
-                        ):
-                            continue
-
-                        title_lower = video_data["snippet"].get("title", "").lower()
-                        description_lower = description.lower()
-
-                        import re
-
-                        has_keyword_in_title = any(
-                            re.search(r"\b" + re.escape(keyword) + r"\b", title_lower)
-                            for keyword in keywords
-                        )
-                        has_keyword_in_description = any(
-                            re.search(
-                                r"\b" + re.escape(keyword) + r"\b", description_lower
-                            )
-                            for keyword in keywords
-                        )
-
-                        # Get channel stats
-                        channel_subscriber_count = int(
-                            channel_stats.get(channel_id, {}).get("subscriberCount", 0)
-                        )
-
-                        # Create video details
-                        video_details = VideoDetails(
-                            videoId=video_id,
-                            title=video_data["snippet"].get("title", ""),
-                            channelTitle=video_data["snippet"].get("channelTitle", ""),
-                            channelId=channel_id,
-                            publishTime=video_data["snippet"].get("publishedAt", ""),
-                            viewCount=int(video_data["statistics"].get("viewCount", 0)),
-                            likeCount=int(video_data["statistics"].get("likeCount", 0)),
-                            commentCount=int(
-                                video_data["statistics"].get("commentCount", 0)
-                            ),
-                            subscriberCount=channel_subscriber_count,
-                            duration=video_data["contentDetails"].get("duration", ""),
-                            description=description,
-                            thumbnails=video_data["snippet"].get("thumbnails", {}),
-                            videoLink=f"https://www.youtube.com/watch?v={video_id}",
-                            channelLink=f"https://www.youtube.com/channel/{channel_id}",
-                            relevancy_score=calculate_relevancy_score(
-                                video_data, keywords
-                            ),
-                            brand_links=brand_links,
-                            country=video_country,
-                            has_keyword_in_title=has_keyword_in_title,
-                            has_keyword_in_description=has_keyword_in_description,
-                        )
-
-                        # Cache this video for future use
-                        cache.store_video(
-                            video_details, expire=7 * 24 * 60 * 60
-                        )  # 1 week cache for videos
-
-                        # Add to results if not already present
-                        all_videos.append(video_details)
+                return batch_results
 
             except Exception as e:
-                print(f"Error processing batch {i//50 + 1}: {str(e)}")
+                print(f"❌ Error processing batch {batch_id+1}: {str(e)}")
+                return {}  # Return empty dict on error
 
-        # If we still need more videos, process remaining ones individually
-        if len(all_videos) < payload.max_results * 1.2 and len(video_id_list) > 0:
-            print(
-                f"Batch processing yielded {len(all_videos)} videos, processing remainders individually..."
-            )
+        # Create concurrent tasks for all batches
+        batch_tasks = []
+        for i, batch in enumerate(batches):
+            task = process_batch(i, batch)
+            batch_tasks.append(task)
 
-            # Process remaining videos individually to ensure we get enough results
-            remaining_ids = [
-                vid
-                for vid in video_id_list
-                if vid not in [v.videoId for v in all_videos]
-            ]
-            remaining_tasks = []
+        # Execute all batch tasks concurrently
+        print(f"Starting concurrent execution of {len(batch_tasks)} batch tasks...")
+        batch_results_list = await asyncio.gather(*batch_tasks)
 
-            for video_id in remaining_ids[
-                : payload.max_results * 3
-            ]:  # Limit how many we process
-                remaining_tasks.append(
-                    process_video(
-                        video_id,
-                        keywords,
-                        all_videos,
-                        payload.min_views,
-                        youtube_manager,  # Pass the manager
-                        cache,  # Pass the cache
-                        publish_after_dt,
-                        publish_before_dt,
-                        country_code,
-                        excluded_channels,
-                    )
-                )
+        # Update all_results with the batch results
+        for batch_results in batch_results_list:
+            for video_id, details in batch_results.items():
+                index = video_id_to_index.get(video_id)
+                if index is not None:
+                    all_results[index]["duration"] = details["duration"]
+                    all_results[index]["durationSeconds"] = details["durationSeconds"]
+                    all_results[index]["viewCount"] = details["viewCount"]
+                    all_results[index]["likeCount"] = details["likeCount"]
+                    all_results[index]["relevancy_score"] = details["relevancy_score"]
 
-            # Process in smaller batches for better control
-            BATCH_SIZE = 25
-            for i in range(0, len(remaining_tasks), BATCH_SIZE):
-                batch = remaining_tasks[i : i + BATCH_SIZE]
-                await asyncio.gather(*batch)
-
-                # Check if we have enough now
-                if len(all_videos) >= payload.max_results * 1.5:
-                    print(
-                        f"Found {len(all_videos)} videos, stopping further processing"
-                    )
-                    break
-
-        phase2_time = time.time() - phase2_start
+        details_time = time.time() - details_start
         print(
-            f"Phase 2 complete: Processed videos in {phase2_time:.2f}s, found {len(all_videos)} valid videos"
+            f"Phase 2 complete: fetched video details concurrently in {details_time:.2f} seconds"
         )
 
-        # Final filtering phase
-        print(f"Initial video count: {len(all_videos)}")
+        # ===== PHASE 3: Get Channel Details (Subscriber Count and Country) CONCURRENTLY =====
+        channel_details_start = time.time()
 
-        # Apply keyword location filter
-        filtered_videos = []
-        for video in all_videos:
-            include_video = False
+        # Extract unique channel IDs from all videos
+        unique_channel_ids = set(
+            video["channelId"] for video in all_results if video.get("channelId")
+        )
+        channel_ids_list = list(unique_channel_ids)
 
-            if payload.keyword_filter == KeywordFilterOption.ANY:
-                # Default behavior - include all videos that passed the relevancy check
-                include_video = True
-            elif payload.keyword_filter == KeywordFilterOption.TITLE_ONLY:
-                # Only include if keyword is in title BUT NOT in description
-                include_video = (
-                    video.has_keyword_in_title and not video.has_keyword_in_description
-                )
-            elif payload.keyword_filter == KeywordFilterOption.DESCRIPTION_ONLY:
-                # Only include if keyword is in description BUT NOT in title
-                include_video = (
-                    video.has_keyword_in_description and not video.has_keyword_in_title
-                )
-            elif payload.keyword_filter == KeywordFilterOption.TITLE_AND_DESCRIPTION:
-                # Must be in both title AND description
-                include_video = (
-                    video.has_keyword_in_title and video.has_keyword_in_description
-                )
-            if include_video:
-                filtered_videos.append(video)
-
-        print(f"After {payload.keyword_filter} filtering: {len(filtered_videos)}")
-
-        # Sort the filtered videos
-        filtered_videos.sort(
-            key=lambda x: (x.relevancy_score, x.viewCount), reverse=True
+        print(
+            f"Phase 3: Found {len(channel_ids_list)} unique channels to fetch data for"
         )
 
-        # Return exactly max_results videos or all available if less than max_results
-        final_results = (
-            filtered_videos[: payload.max_results] if filtered_videos else []
+        # Create a channelId to details mapping
+        channel_id_to_details = {}
+
+        # Create batches of 50 channels (YouTube API limit)
+        channel_batches = []
+        for i in range(0, len(channel_ids_list), 50):
+            channel_batches.append(channel_ids_list[i : i + 50])
+
+        total_channel_batches = len(channel_batches)
+        print(
+            f"Phase 3: Fetching details for {len(channel_ids_list)} channels in {total_channel_batches} concurrent batches"
         )
 
-        # If we still don't have enough results, attempt a last-resort relaxed search
-        if len(final_results) < payload.max_results and len(final_results) > 0:
-            print(
-                f"Warning: Only found {len(final_results)} valid results out of {payload.max_results} requested"
-            )
-            print("Attempting final expanded search with relaxed criteria...")
+        # Define a function to process one batch of channels
+        async def process_channel_batch(batch_id, channel_batch):
+            batch_start = time.time()
 
-            # This would be the place to add a last-resort search strategy
-            # For example, you could lower the minimum view count, expand search terms, etc.
-            # However, this would require a significant code addition
+            try:
+                # Fetch details for this batch of channels
+                async def get_channel_details(youtube):
+                    return (
+                        youtube.channels()
+                        .list(part="statistics,snippet", id=",".join(channel_batch))
+                        .execute()
+                    )
 
-        # Cache the results before returning
+                channel_response = await youtube_manager.execute_with_retry(
+                    get_channel_details, "channels.list"
+                )
+
+                # Process the batch results
+                batch_results = {}  # Store results to update atomically later
+
+                for item in channel_response.get("items", []):
+                    channel_id = item["id"]
+
+                    # Extract statistics and snippet data
+                    statistics = item.get("statistics", {})
+                    snippet = item.get("snippet", {})
+                    branding = item.get("brandingSettings", {}).get("channel", {})
+
+                    # Get subscriber count and country
+                    subscriber_count = int(statistics.get("subscriberCount", 0))
+                    country = snippet.get("country", "")
+                    keywords = snippet.get("keywords", "")
+                    channel_link = f"https://www.youtube.com/channel/{channel_id}"
+                    channel_description = snippet.get("description", "")
+                    channel_title = snippet.get("title", "")
+                    channel_type = branding.get("profileType", "")
+
+                    # Determine if this is a music channel, comedy channel, etc.
+                    is_music_channel = any(
+                        term in channel_title.lower() or term in keywords.lower()
+                        for term in [
+                            "music",
+                            "songs",
+                            "record",
+                            "artist",
+                            "band",
+                            "singer",
+                        ]
+                    )
+                    is_meme_channel = any(
+                        term in channel_title.lower() or term in keywords.lower()
+                        for term in ["meme", "funny", "comedy", "laugh", "humor"]
+                    )
+
+                    # Store in batch results
+                    batch_results[channel_id] = {
+                        "subscriberCount": subscriber_count,
+                        "country": country,
+                        "channelLink": channel_link,
+                        "is_music_channel": is_music_channel,
+                        "is_meme_channel": is_meme_channel,
+                    }
+
+                batch_time = time.time() - batch_start
+                print(
+                    f"✅ Channel Batch {batch_id+1}/{total_channel_batches} completed in {batch_time:.2f}s"
+                )
+
+                return batch_results
+
+            except Exception as e:
+                print(f"❌ Error processing channel batch {batch_id+1}: {str(e)}")
+                return {}  # Return empty dict on error
+
+        # Create concurrent tasks for all channel batches
+        channel_batch_tasks = []
+        for i, batch in enumerate(channel_batches):
+            task = process_channel_batch(i, batch)
+            channel_batch_tasks.append(task)
+
+        # Execute all channel batch tasks concurrently
+        print(
+            f"Starting concurrent execution of {len(channel_batch_tasks)} channel batch tasks..."
+        )
+        channel_batch_results_list = await asyncio.gather(*channel_batch_tasks)
+
+        # Combine all channel batch results into a single dictionary
+        for batch_results in channel_batch_results_list:
+            channel_id_to_details.update(batch_results)
+
+        # Now update all videos with their channel's details
+        for video in all_results:
+            channel_id = video.get("channelId", "")
+            if channel_id and channel_id in channel_id_to_details:
+                details = channel_id_to_details[channel_id]
+                video["subscriberCount"] = details["subscriberCount"]
+                video["country"] = details.get("country", "") or video["country"]
+                video["channelLink"] = details["channelLink"]
+
+                # Filter out music videos and meme videos with lower relevancy scores
+                if (
+                    details.get("is_music_channel") or details.get("is_meme_channel")
+                ) and video["relevancy_score"] < 5:
+                    video["relevancy_score"] = max(0, video["relevancy_score"] - 3)
+            else:
+                # Default values if channel details not found
+                video["subscriberCount"] = 0
+                video["country"] = ""
+                video["channelLink"] = f"https://www.youtube.com/channel/{channel_id}"
+
+        channel_details_time = time.time() - channel_details_start
+        print(
+            f"Phase 3 complete: fetched channel details concurrently in {channel_details_time:.2f} seconds"
+        )
+
+        # ===== PHASE 4: Extract Brand-Related URLs from Descriptions Check for Keywords CONCURRENTLY =====
+        text_analysis_start = time.time()
+
+        # Import re and urlparse if not already imported
+        import re
+        from urllib.parse import urlparse
+
+        # First, ensure we have the list of keywords from the payload
+        keywords = [kw.strip() for kw in payload.brand_name.split(",") if kw.strip()]
+        print(f"Phase 4: Extracting brand URLs using keywords: {keywords}")
+
+        # Process keywords for better matching
+        processed_keywords = []
+        for keyword in keywords:
+            # Clean each keyword and convert to lowercase for case-insensitive matching
+            clean_keyword = keyword.lower().strip()
+            processed_keywords.append(clean_keyword)
+
+        # Create batches of videos for processing (50 per batch)
+        video_batches = []
+        for i in range(0, len(all_results), 50):
+            video_batches.append(all_results[i : i + 50])
+
+        total_analysis_batches = len(video_batches)
+        print(
+            f"Phase 4: Processing text in {total_analysis_batches} concurrent batches"
+        )
+
+        # Define a function to process one batch of videos
+        async def process_text_batch(batch_id, videos_batch):
+            batch_start = time.time()
+            loop = asyncio.get_running_loop()
+
+            try:
+                # Process each video in the batch
+                def process_batch_content():
+                    results = {}
+                    for video in videos_batch:
+                        video_id = video["videoId"]
+                        title = video.get("title", "").lower()
+                        description = video.get("description", "").lower()
+
+                        # Check for keywords in title and description
+                        has_keyword_in_title = any(
+                            keyword in title for keyword in processed_keywords
+                        )
+                        has_keyword_in_description = any(
+                            keyword in description for keyword in processed_keywords
+                        )
+
+                        # Extract brand-related URLs from the description
+                        brand_urls = extract_brand_related_urls(description, keywords)
+
+                        # Store results
+                        results[video_id] = {
+                            "brand_links": brand_urls,
+                            "has_keyword_in_title": has_keyword_in_title,
+                            "has_keyword_in_description": has_keyword_in_description,
+                            "has_sponsored_links": len(brand_urls)
+                            > 0,  # Flag if brand links exist
+                        }
+
+                    return results
+
+                # Execute the CPU-bound work in a thread pool
+                batch_results = await loop.run_in_executor(None, process_batch_content)
+
+                batch_time = time.time() - batch_start
+                print(
+                    f"✅ Text Analysis Batch {batch_id+1}/{total_analysis_batches} completed in {batch_time:.2f}s"
+                )
+
+                return batch_results
+
+            except Exception as e:
+                print(f"❌ Error processing text analysis batch {batch_id+1}: {str(e)}")
+                return {}  # Return empty dict on error
+
+        # Create concurrent tasks for all text analysis batches
+        text_batch_tasks = []
+        for i, batch in enumerate(video_batches):
+            task = process_text_batch(i, batch)
+            text_batch_tasks.append(task)
+
+        # Execute all text analysis tasks concurrently
+        print(
+            f"Starting concurrent execution of {len(text_batch_tasks)} text analysis tasks..."
+        )
+        text_batch_results_list = await asyncio.gather(*text_batch_tasks)
+
+        # Process text analysis results
+        video_id_to_text_analysis = {}
+        for batch_results in text_batch_results_list:
+            video_id_to_text_analysis.update(batch_results)
+
+        # Update all videos with their text analysis results
+        for video in all_results:
+            video_id = video["videoId"]
+            if video_id in video_id_to_text_analysis:
+                analysis = video_id_to_text_analysis[video_id]
+                video["brand_links"] = analysis["brand_links"]
+                video["has_keyword_in_title"] = analysis["has_keyword_in_title"]
+                video["has_keyword_in_description"] = analysis[
+                    "has_keyword_in_description"
+                ]
+                video["has_sponsored_links"] = analysis["has_sponsored_links"]
+            else:
+                video["brand_links"] = []
+                video["has_keyword_in_title"] = False
+                video["has_keyword_in_description"] = False
+                video["has_sponsored_links"] = False
+
+        text_analysis_time = time.time() - text_analysis_start
+        print(
+            f"Phase 4 complete: processed all text content in {text_analysis_time:.2f} seconds"
+        )
+
+        # Update the total time report to include brand links extraction phase
+        total_time = time.time() - start_time
+        print(f"Total execution time: {total_time:.2f} seconds")
+        print(f"  - Search phase: {search_time:.2f}s")
+        print(f"  - Video details phase: {details_time:.2f}s")
+        print(f"  - Channel details phase: {channel_details_time:.2f}s")
+        print(f"  - Brand links extraction: {text_analysis_time:.2f}s")
+
+        # After all phases complete, store data in CSV
         try:
-            # Serialize the VideoDetails objects
-            results_dict = [result.dict() for result in final_results]
-            serialized_data = json.dumps(results_dict)
+            # Convert results to pandas dataframe
+            csv_start = time.time()
 
-            # Store in Redis with 1 hour expiration
-            redis_client.setex(cache_key, 3600, serialized_data)  # 1 hour in seconds
-            print(f"✅ Cached {len(final_results)} results with key: {cache_key}")
+            # Normalize nested structures for CSV storage
+            flattened_results = []
+            for video in all_results:
+                # Create a copy to avoid modifying original data
+                flat_video = video.copy()
+
+                # Convert nested thumbnails to just the high resolution URL
+                if "thumbnails" in flat_video and "high" in flat_video["thumbnails"]:
+                    flat_video["thumbnail_url"] = flat_video["thumbnails"]["high"].get(
+                        "url", ""
+                    )
+                else:
+                    flat_video["thumbnail_url"] = ""
+
+                # Convert brand_links list to string
+                if "brand_links" in flat_video and isinstance(
+                    flat_video["brand_links"], list
+                ):
+                    flat_video["brand_links_str"] = "|".join(flat_video["brand_links"])
+                else:
+                    flat_video["brand_links_str"] = ""
+
+                # Remove complex nested structures before CSV storage
+                flat_video.pop("thumbnails", None)
+                flat_video.pop("brand_links", None)
+
+                flattened_results.append(flat_video)
+
+            # Create dataframe and save to CSV
+            df = pd.DataFrame(flattened_results)
+            df.to_csv(csv_filename, index=False)
+            print(
+                f"✅ Saved {len(df)} videos to {csv_filename} in {time.time() - csv_start:.2f}s"
+            )
+
+            # Apply filters to the collected data
+            filtered_results = apply_filters(df, payload)
+
+            # Cache the filtered results
+            try:
+                serialized_data = json.dumps(
+                    filtered_results, default=json_serializable
+                )
+                redis_client.setex(cache_key, 3600, serialized_data)
+                print(f"✅ Cached {len(filtered_results)} filtered results")
+            except Exception as e:
+                print(f"Error caching filtered results: {str(e)}")
+
+            return filtered_results
+
         except Exception as e:
-            print(f"Error caching results: {str(e)}")
+            import traceback
 
-        # Log performance
-        elapsed = time.time() - start_time
-        print(f"Full search response time: {elapsed:.4f} seconds")
-
-        return final_results
+            print(traceback.format_exc())
+            raise HTTPException(
+                status_code=500, detail=f"Error saving or filtering data: {str(e)}"
+            )
 
     except Exception as e:
+        import traceback
+
+        print(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Search error: {str(e)}")
+
+
+# Function to apply filters using pandas
+def apply_filters(df, payload):
+    """Apply all filters from SearchRequest to the pandas DataFrame"""
+    filter_start = time.time()
+    print(f"Applying filters to {len(df)} videos...")
+
+    # Create a copy to avoid modifying the original dataframe
+    filtered_df = df.copy()
+
+    # 0. Filter out official brand channels
+    if filtered_df.shape[0] > 0:  # Only if we have data
+        # Get brand keywords for comparison
+        keywords = [
+            kw.strip().lower() for kw in payload.brand_name.split(",") if kw.strip()
+        ]
+
+        # Create a function to detect if a channel is likely an official brand channel
+        def is_official_brand_channel(row, brand_keywords):
+            channel_title = str(row["channelTitle"]).lower()
+
+            # Strong indicators of official channel:
+            # 1. Channel name exactly matches a brand keyword
+            for keyword in brand_keywords:
+                if channel_title == keyword:
+                    return True
+
+                # Check for common official channel patterns
+                official_patterns = [
+                    f"{keyword} official",
+                    f"official {keyword}",
+                    f"{keyword}.com",
+                    f"{keyword} app",
+                    f"{keyword}app",
+                    f"{keyword} official channel",
+                ]
+
+                for pattern in official_patterns:
+                    if pattern in channel_title:
+                        return True
+
+            return False
+
+        # Create a mask for videos NOT from official brand channels
+        not_official_mask = ~filtered_df.apply(
+            lambda row: is_official_brand_channel(row, keywords), axis=1
+        )
+
+        # Apply the filter to remove official brand channels
+        official_count = (~not_official_mask).sum()
+        if official_count > 0:
+            filtered_df = filtered_df[not_official_mask]
+            print(f"Removed {official_count} videos from official brand channels")
+            print(f"After official channel filter: {len(filtered_df)} videos")
+
+    # 0.5. PERMANENT FILTER: Remove videos shorter than 1 minute
+    initial_count = len(filtered_df)
+    # First ensure duration data exists (fill missing values with 0)
+    if "durationSeconds" not in filtered_df.columns:
+        filtered_df["durationSeconds"] = 0
+    else:
+        filtered_df["durationSeconds"] = filtered_df["durationSeconds"].fillna(0)
+
+    filtered_df = filtered_df[
+        filtered_df["durationSeconds"] >= 60
+    ]  # 60 seconds = 1 minute
+    removed_count = initial_count - len(filtered_df)
+    print(f"Removed {removed_count} videos shorter than 1 minute")
+    print(f"After minimum duration filter: {len(filtered_df)} videos")
+
+    # 1. Apply minimum views filter
+    if payload.min_views and payload.min_views > 0:
+        filtered_df = filtered_df[filtered_df["viewCount"] >= payload.min_views]
+        print(f"After min_views filter: {len(filtered_df)} videos")
+
+    # 2. Apply date filter
+    if payload.date_filter != DateFilterOption.ALL_TIME:
+        # Convert publishTime to datetime if it's not already
+        if not pd.api.types.is_datetime64_any_dtype(filtered_df["publishTime"]):
+            filtered_df["publishTime"] = pd.to_datetime(filtered_df["publishTime"])
+
+        now = datetime.now()
+
+        if (
+            payload.date_filter == DateFilterOption.CUSTOM
+            and payload.custom_date_from
+            and payload.custom_date_to
+        ):
+            # Custom date range
+            filtered_df = filtered_df[
+                (filtered_df["publishTime"] >= payload.custom_date_from)
+                & (filtered_df["publishTime"] <= payload.custom_date_to)
+            ]
+        else:
+            # Predefined time ranges
+            time_deltas = {
+                DateFilterOption.PAST_HOUR: timedelta(hours=1),
+                DateFilterOption.PAST_3_HOURS: timedelta(hours=3),
+                DateFilterOption.PAST_6_HOURS: timedelta(hours=6),
+                DateFilterOption.PAST_12_HOURS: timedelta(hours=12),
+                DateFilterOption.PAST_24_HOURS: timedelta(days=1),
+                DateFilterOption.PAST_7_DAYS: timedelta(days=7),
+                DateFilterOption.PAST_30_DAYS: timedelta(days=30),
+                DateFilterOption.PAST_90_DAYS: timedelta(days=90),
+                DateFilterOption.PAST_180_DAYS: timedelta(days=180),
+            }
+
+            if payload.date_filter in time_deltas:
+                cutoff_date = now - time_deltas[payload.date_filter]
+                filtered_df = filtered_df[filtered_df["publishTime"] >= cutoff_date]
+
+        print(f"After date filter: {len(filtered_df)} videos")
+
+    # 3. Apply country filter
+    if payload.country_code:
+        if "country" in filtered_df.columns:
+            # Filter for videos from the specified country
+            country_filter = filtered_df["country"] == payload.country_code
+            filtered_df = filtered_df[country_filter]
+            print(f"After country filter: {len(filtered_df)} videos")
+
+    # 4. Apply excluded channels filter
+    if payload.excluded_channels and len(payload.excluded_channels) > 0:
+        # Convert to lowercase for case-insensitive comparison
+        excluded_channels = [channel.lower() for channel in payload.excluded_channels]
+        filtered_df = filtered_df[
+            ~filtered_df["channelTitle"].str.lower().isin(excluded_channels)
+        ]
+        print(f"After excluded channels filter: {len(filtered_df)} videos")
+
+    # 5. Apply keyword location filter
+    if payload.keyword_filter != KeywordFilterOption.ANY:
+        # Create keyword regex pattern for case-insensitive matching
+        keywords = [
+            kw.strip().lower() for kw in payload.brand_name.split(",") if kw.strip()
+        ]
+
+        if payload.keyword_filter == KeywordFilterOption.TITLE_ONLY:
+            filtered_df = filtered_df[filtered_df["has_keyword_in_title"] == True]
+        elif payload.keyword_filter == KeywordFilterOption.DESCRIPTION_ONLY:
+            filtered_df = filtered_df[filtered_df["has_keyword_in_description"] == True]
+        elif payload.keyword_filter == KeywordFilterOption.TITLE_AND_DESCRIPTION:
+            filtered_df = filtered_df[
+                (filtered_df["has_keyword_in_title"] == True)
+                & (filtered_df["has_keyword_in_description"] == True)
+            ]
+
+        print(f"After keyword location filter: {len(filtered_df)} videos")
+
+    # 6. Sort by relevancy score and view count
+    # First ensure the relevancy_score column exists
+    if "relevancy_score" not in filtered_df.columns:
+        filtered_df["relevancy_score"] = 0
+
+    # Sort by relevancy score (high to low) and then by view count (high to low)
+    filtered_df = filtered_df.sort_values(
+        ["relevancy_score", "viewCount"], ascending=[False, False]
+    )
+
+    # Convert back to dictionary format for the API response
+    result_records = filtered_df.head(payload.max_results).to_dict("records")
+
+    # Reconstruct nested structures with proper type checking
+    for record in result_records:
+        # Reconstruct thumbnails
+        if "thumbnail_url" in record:
+            record["thumbnails"] = {"high": {"url": record["thumbnail_url"]}}
+            record.pop("thumbnail_url", None)
+
+        # Reconstruct brand_links with proper type checking
+        if "brand_links_str" in record:
+            try:
+                # Check if it's a string before splitting
+                if (
+                    isinstance(record["brand_links_str"], str)
+                    and record["brand_links_str"]
+                ):
+                    record["brand_links"] = record["brand_links_str"].split("|")
+                else:
+                    record["brand_links"] = []
+            except:
+                # Fallback for any errors
+                record["brand_links"] = []
+            record.pop("brand_links_str", None)
+
+    filter_time = time.time() - filter_start
+    print(
+        f"Filtering completed in {filter_time:.2f}s. Returning {len(result_records)} videos."
+    )
+
+    return result_records
 
 
 @app.get("/redis-test")

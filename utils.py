@@ -55,7 +55,7 @@ def extract_brand_related_urls(description: str, keywords: List[str]) -> List[st
     # Clean the description first
     description = description.replace('\n', ' ').replace('\r', ' ')
     
-    # Common domains to exclude
+    # Common domains to exclude (MODIFIED - removed onelink.me from excluded)
     excluded_domains = {
         'facebook.com', 'fb.com', 'instagram.com', 'twitter.com', 'youtube.com',
         'tiktok.com', 'linkedin.com', 'pinterest.com', 'reddit.com', 't.me',
@@ -64,9 +64,14 @@ def extract_brand_related_urls(description: str, keywords: List[str]) -> List[st
         'spf.bio'
     }
 
+    # Whitelist for app/product link domains that should ALWAYS be included
+    whitelist_domains = {
+        'onelink.me', 'page.link', 'goo.gl', 'amzn.to'
+    }
+
     # Regex to find URLs in text - improved pattern
     url_pattern = re.compile(
-        r'https?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\$$\$$,]|(?:%[0-9a-fA-F][0-9a-fA-F]))+'
+        r'https?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*$$$$,]|(?:%[0-9a-fA-F][0-9a-fA-F]))+'
     )
 
     # Find all URLs in cleaned description
@@ -80,11 +85,16 @@ def extract_brand_related_urls(description: str, keywords: List[str]) -> List[st
         # Add both original and no-space versions
         processed_keywords.add(clean_keyword)
         processed_keywords.add(clean_keyword.replace(" ", ""))
-        # Add variations
-        if "sahi" in clean_keyword:
+        
+        # Add common variations
+        if "nykaa" in clean_keyword:
+            processed_keywords.update(["nykaa", "nykaafashion", "nykaaman", "nyxcosmetics"])
+        elif "sahi" in clean_keyword:
             processed_keywords.update(["sahi", "sahitrade", "sahiapp"])
 
     brand_related_urls = []
+    utm_urls = []  # Track URLs with UTM parameters
+
     for url in urls:
         try:
             # Clean the URL
@@ -97,21 +107,36 @@ def extract_brand_related_urls(description: str, keywords: List[str]) -> List[st
             domain = parsed_url.netloc.lower()
             if domain.startswith('www.'):
                 domain = domain[4:]
+            
+            # Check for UTM parameters
+            has_utm = False
+            if parsed_url.query:
+                query_params = parsed_url.query.lower()
+                if 'utm_' in query_params:
+                    has_utm = True
+                    utm_urls.append(url)
+            
+            # Always include whitelisted domains regardless of other criteria
+            if any(domain.endswith(d) for d in whitelist_domains):
+                for keyword in processed_keywords:
+                    # Check if brand name is in the URL anywhere
+                    if keyword in url.lower():
+                        brand_related_urls.append(url)
+                        break
+                continue
 
             # Skip excluded domains
             if domain in excluded_domains:
                 continue
 
+            # Check for subdomains like "nykaa.onelink.me"
+            domain_parts = domain.split('.')
+            if any(part in processed_keywords for part in domain_parts):
+                brand_related_urls.append(url)
+                continue
+
             # Create a clean version of the URL for matching
             url_text = f"{domain} {parsed_url.path}".lower()
-
-            # Special handling for app download links
-            if any(d in domain for d in ['onelink.me', 'page.link']):
-                for keyword in processed_keywords:
-                    if keyword in url_text:
-                        brand_related_urls.append(url)
-                        break
-                continue
 
             # Check if URL is brand-related
             is_brand_link = False
@@ -132,4 +157,6 @@ def extract_brand_related_urls(description: str, keywords: List[str]) -> List[st
             print(f"Error processing URL {url}: {str(e)}")
             continue
 
-    return list(set(brand_related_urls))  # Remove duplicates
+    # Combine all unique URLs
+    all_urls = list(set(brand_related_urls + utm_urls))
+    return all_urls

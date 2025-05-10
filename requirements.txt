@@ -2,6 +2,7 @@
 fastapi[standard]
 uvicorn[standard]
 pydantic
+pandas
 
 # Async HTTP
 aiohttp

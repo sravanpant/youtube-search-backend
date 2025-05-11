@@ -140,10 +140,9 @@ async def search_videos_snippet_only(payload: SearchRequest):
     keywords = [
         kw.strip().lower() for kw in payload.brand_name.split(",") if kw.strip()
     ]
-    brand_key = "_".join(keywords)
 
     # Define CSV filename based on brand name
-    csv_filename = f"videos_data_{brand_key}.csv"
+    csv_filename = f"videos_data.csv"
 
     # ---- DYNAMIC COLLECTION TARGET BASED ON MAX_RESULTS ----
     if payload.max_results <= 50:
@@ -158,55 +157,6 @@ async def search_videos_snippet_only(payload: SearchRequest):
     print(
         f"Setting collection target to {COLLECTION_TARGET} videos for max_results={payload.max_results}"
     )
-
-    # First, check if we already have data for this brand
-    if os.path.exists(csv_filename):
-        print(f"Found existing data file for {brand_key}. Loading from CSV...")
-        try:
-            # Load data from CSV using pandas
-            data_loading_start = time.time()
-            df = pd.read_csv(csv_filename)
-
-            # Ensure all string columns are actually strings, not floats
-            string_columns = [
-                "brand_links_str",
-                "description",
-                "title",
-                "channelTitle",
-                "country",
-            ]
-            for col in string_columns:
-                if col in df.columns:
-                    df[col] = df[col].fillna("").astype(str)
-
-            print(
-                f"Loaded {len(df)} records from CSV in {time.time() - data_loading_start:.2f}s"
-            )
-
-            # Apply filters to the loaded data
-            try:
-                filtered_results = apply_filters(df, payload)
-
-                # Cache the filtered results
-                try:
-                    serialized_data = json.dumps(
-                        filtered_results, default=json_serializable
-                    )
-                    redis_client.setex(cache_key, 3600, serialized_data)
-                    print(f"✅ Cached {len(filtered_results)} filtered results")
-                except Exception as e:
-                    print(f"Error caching filtered results: {str(e)}")
-
-                return filtered_results
-            except Exception as e:
-                import traceback
-
-                print(f"Error applying filters: {str(e)}")
-                print(traceback.format_exc())
-                # Continue to collect new data
-
-        except Exception as e:
-            print(f"Error loading from CSV: {str(e)}. Will collect new data.")
 
     all_results = []
     seen_video_ids = set()
@@ -226,6 +176,177 @@ async def search_videos_snippet_only(payload: SearchRequest):
 
     # Search phase start time
     search_start = time.time()
+
+    # IMPROVED FUNCTION: Detect if a channel is an official brand channel
+    def is_official_brand_channel(channel_title, keywords):
+        """
+        Enhanced detection of official brand channels based on various patterns.
+        """
+        channel_title_lower = channel_title.lower()
+
+        # Common languages that might be used in channel names
+        languages = [
+            "hindi",
+            "english",
+            "telugu",
+            "tamil",
+            "kannada",
+            "malayalam",
+            "bengali",
+            "marathi",
+            "gujarati",
+            "punjabi",
+            "urdu",
+            "odia",
+            "assamese",
+            "spanish",
+            "french",
+            "german",
+            "chinese",
+            "japanese",
+        ]
+
+        # Common patterns that indicate official channels
+        official_patterns = [
+            "official",
+            ".com",
+            "app",
+            "official channel",
+            "official page",
+            "learn with",
+            "tech",
+            "technology",
+            "digital",
+            "support",
+            "help",
+            "customer service",
+            "tutorials",
+            "studio",
+            "hq",
+            "headquarters",
+            "global",
+            "india",
+            "us",
+            "uk",
+            "tv",
+            "media",
+            "videos",
+            "channel",
+        ]
+
+        # Finance/Investment specific patterns (for brands like Groww)
+        finance_patterns = [
+            "invest",
+            "investing",
+            "investor",
+            "investment",
+            "finance",
+            "financial",
+            "wealth",
+            "money",
+            "stocks",
+            "stock market",
+            "mutual fund",
+            "mutual funds",
+            "mf",
+            "amc",
+            "asset",
+            "management",
+            "portfolio",
+            "trading",
+            "trader",
+            "market",
+            "equity",
+            "crypto",
+            "thrive",
+            "grow",
+            "savings",
+            "sip",
+            "capital",
+            "wealth",
+        ]
+
+        # Common prepositions and conjunctions used in channel names
+        connectors = ["with", "by", "for", "on", "in", "and", "at", "&", "+", "-"]
+
+        for keyword in keywords:
+            # 1. EXACT MATCH - Most obvious case
+            if channel_title_lower == keyword:
+                return True
+
+            # 2. BRAND NAME IS A SIGNIFICANT PART OF THE CHANNEL NAME
+            # Check if brand is at beginning, middle, or end with word boundaries
+            import re
+
+            keyword_pattern = r"\b" + re.escape(keyword) + r"\b"
+            if re.search(keyword_pattern, channel_title_lower):
+
+                # 3. BRAND + SOMETHING or SOMETHING + BRAND
+                # Check for patterns like "[brand] [anything]" or "[anything] [brand]"
+                words = channel_title_lower.split()
+                if len(words) >= 2:
+                    # If brand is first or last word in channel name
+                    if words[0] == keyword or words[-1] == keyword:
+                        return True
+
+                    # If brand is anywhere in the name
+                    for i, word in enumerate(words):
+                        if word == keyword:
+                            # Check words around the keyword
+                            # If surrounded by finance terms
+                            for w in words:
+                                if w in finance_patterns or any(
+                                    p in w for p in finance_patterns
+                                ):
+                                    return True
+
+                            # Check for patterns with connectors like "with", "by", etc.
+                            if i > 0 and words[i - 1] in connectors:
+                                return True
+                            if i < len(words) - 1 and words[i + 1] in connectors:
+                                return True
+
+                # 4. BRAND NAME WITH SPECIFIC ADDITIONS
+                # Check for key patterns that strongly suggest official status
+
+                # Financial/Investment services patterns
+                for pattern in finance_patterns:
+                    if f"{keyword} {pattern}" in channel_title_lower:
+                        return True
+                    if f"{pattern} {keyword}" in channel_title_lower:
+                        return True
+
+                    # Also check with connectors
+                    for connector in connectors:
+                        # "mutual funds with groww", "thrive by groww", etc.
+                        if f"{pattern} {connector} {keyword}" in channel_title_lower:
+                            return True
+                        if f"{keyword} {connector} {pattern}" in channel_title_lower:
+                            return True
+
+                # Official channel patterns
+                for pattern in official_patterns:
+                    if f"{keyword} {pattern}" in channel_title_lower:
+                        return True
+                    if f"{pattern} {keyword}" in channel_title_lower:
+                        return True
+
+                # Language-specific channels
+                for lang in languages:
+                    if f"{keyword} {lang}" in channel_title_lower:
+                        return True
+                    if f"{lang} {keyword}" in channel_title_lower:
+                        return True
+
+            # 5. ACRONYM DETECTION
+            # For brands with multiple words, check for acronym usage
+            if " " in keyword:
+                # Create acronym from multi-word brand name
+                acronym = "".join(word[0] for word in keyword.split())
+                if acronym.lower() in channel_title_lower:
+                    return True
+
+        return False
 
     try:
         # Run searches until we collect enough videos
@@ -315,35 +436,7 @@ async def search_videos_snippet_only(payload: SearchRequest):
                                 continue
 
                             # IMPROVED OFFICIAL CHANNEL DETECTION
-                            # Skip if this is likely the brand's official channel
-                            is_official = False
-                            for kw in keywords:
-                                # Exact match for channel name
-                                if channel_title.lower() == kw:
-                                    is_official = True
-                                    break
-
-                                # Common official channel patterns
-                                official_patterns = [
-                                    f"{kw} official",
-                                    f"official {kw}",
-                                    f"{kw}.com",
-                                    f"{kw} app",
-                                    f"{kw}app",
-                                    f"{kw} official channel",
-                                ]
-
-                                if any(
-                                    pattern in channel_title.lower()
-                                    for pattern in official_patterns
-                                ):
-                                    is_official = True
-                                    break
-
-                            if is_official:
-                                # print(
-                                #     f"Skipping official channel video: {title} ({channel_title})"
-                                # )
+                            if is_official_brand_channel(channel_title, keywords):
                                 continue
 
                             video_link = f"https://www.youtube.com/watch?v={video_id}"
@@ -849,52 +942,7 @@ def apply_filters(df, payload):
     # Create a copy to avoid modifying the original dataframe
     filtered_df = df.copy()
 
-    # 0. Filter out official brand channels
-    if filtered_df.shape[0] > 0:  # Only if we have data
-        # Get brand keywords for comparison
-        keywords = [
-            kw.strip().lower() for kw in payload.brand_name.split(",") if kw.strip()
-        ]
-
-        # Create a function to detect if a channel is likely an official brand channel
-        def is_official_brand_channel(row, brand_keywords):
-            channel_title = str(row["channelTitle"]).lower()
-
-            # Strong indicators of official channel:
-            # 1. Channel name exactly matches a brand keyword
-            for keyword in brand_keywords:
-                if channel_title == keyword:
-                    return True
-
-                # Check for common official channel patterns
-                official_patterns = [
-                    f"{keyword} official",
-                    f"official {keyword}",
-                    f"{keyword}.com",
-                    f"{keyword} app",
-                    f"{keyword}app",
-                    f"{keyword} official channel",
-                ]
-
-                for pattern in official_patterns:
-                    if pattern in channel_title:
-                        return True
-
-            return False
-
-        # Create a mask for videos NOT from official brand channels
-        not_official_mask = ~filtered_df.apply(
-            lambda row: is_official_brand_channel(row, keywords), axis=1
-        )
-
-        # Apply the filter to remove official brand channels
-        official_count = (~not_official_mask).sum()
-        if official_count > 0:
-            filtered_df = filtered_df[not_official_mask]
-            print(f"Removed {official_count} videos from official brand channels")
-            print(f"After official channel filter: {len(filtered_df)} videos")
-
-    # 0.5. PERMANENT FILTER: Remove videos shorter than 1 minute
+    # 0. PERMANENT FILTER: Remove videos shorter than 1 minute
     initial_count = len(filtered_df)
     # First ensure duration data exists (fill missing values with 0)
     if "durationSeconds" not in filtered_df.columns:
@@ -1076,6 +1124,43 @@ async def get_cache_info(key: str = None):
             }
     except Exception as e:
         return {"error": str(e)}
+
+
+@app.delete("/cache/{cache_key}")
+async def delete_cache(cache_key: str):
+    """
+    Delete a specific cache entry from Redis.
+
+    Args:
+        cache_key: The cache key to delete (without the 'search:' prefix)
+
+    Returns:
+        JSON response with deletion status
+    """
+    try:
+        # Add 'search:' prefix if not already present
+        full_key = (
+            cache_key if cache_key.startswith("search:") else f"search:{cache_key}"
+        )
+
+        # Check if key exists first
+        exists = redis_client.exists(full_key)
+
+        if exists:
+            # Delete the key
+            deleted = redis_client.delete(full_key)
+            return {
+                "success": True,
+                "message": f"Cache entry '{full_key}' successfully deleted",
+                "deleted_count": deleted,
+            }
+        else:
+            return {
+                "success": False,
+                "message": f"Cache entry '{full_key}' not found in Redis",
+            }
+    except Exception as e:
+        return {"success": False, "message": f"Error deleting cache entry: {str(e)}"}
 
 
 if __name__ == "__main__":

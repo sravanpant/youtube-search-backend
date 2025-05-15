@@ -12,6 +12,7 @@ google-api-python-client
 # Environment and Utils
 python-dotenv
 isodate
+pytz
 
 # CORS and Middleware
 starlette

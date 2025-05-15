@@ -968,17 +968,29 @@ def apply_filters(df, payload):
         if not pd.api.types.is_datetime64_any_dtype(filtered_df["publishTime"]):
             filtered_df["publishTime"] = pd.to_datetime(filtered_df["publishTime"])
 
-        now = datetime.now()
+        # Make sure we use timezone-aware datetime for comparison
+        import pytz
+
+        # Create a timezone-aware "now"
+        now = datetime.now(pytz.UTC)
 
         if (
             payload.date_filter == DateFilterOption.CUSTOM
             and payload.custom_date_from
             and payload.custom_date_to
         ):
-            # Custom date range
+            # Make custom dates timezone-aware if they aren't already
+            from_date = payload.custom_date_from
+            to_date = payload.custom_date_to
+
+            if from_date.tzinfo is None:
+                from_date = from_date.replace(tzinfo=pytz.UTC)
+            if to_date.tzinfo is None:
+                to_date = to_date.replace(tzinfo=pytz.UTC)
+
             filtered_df = filtered_df[
-                (filtered_df["publishTime"] >= payload.custom_date_from)
-                & (filtered_df["publishTime"] <= payload.custom_date_to)
+                (filtered_df["publishTime"] >= from_date)
+                & (filtered_df["publishTime"] <= to_date)
             ]
         else:
             # Predefined time ranges
